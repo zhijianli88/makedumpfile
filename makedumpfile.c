@@ -29,6 +29,7 @@
 #include <zlib.h>
 #include <sys/types.h>
 #include <ndctl/libndctl.h>
+#include <openssl/sha.h>
 
 struct symbol_table	symbol_table;
 struct size_table	size_table;
@@ -6544,6 +6545,35 @@ int inspect_pmem_namespace(void)
 	return 0;
 }
 
+#define DIGEST_LENGTH 64
+void metadata_sha256(mdf_pfn_t pfn, unsigned long mem_map)
+{
+	int i;
+	SHA256_CTX c;
+	unsigned char m[SHA256_DIGEST_LENGTH];
+	struct pmem_metadata_node *head = pmem_head;
+	unsigned char page[4096];
+	unsigned char outputBuffer[DIGEST_LENGTH + 1];
+
+	while (head) {
+		if (head->start == pfn) {
+			SHA256_Init(&c);
+			for (i = pfn; i < head->end; i++, mem_map += SIZE(page)) {
+				if (!readmem(PADDR, pfn_to_paddr(i), page, 4096))
+					ERRMSG("Can't get the page data(pfn:%llx).\n", pfn);
+				SHA256_Update(&c, page, 4096);
+			}
+			SHA256_Final(m, &c);
+			for(int j = 0; j < SHA256_DIGEST_LENGTH; j++) {
+				sprintf((char *)outputBuffer + (j * 2), "%02x", m[j]);
+			}
+			outputBuffer[DIGEST_LENGTH] = 0;
+			MSG("pfn: [%llx - %llx), sha256[%x]: %s\n", head->start, head->end, i, outputBuffer);
+		}
+		head = head->next;
+	}
+}
+
 int
 __exclude_unnecessary_pages(unsigned long mem_map,
     mdf_pfn_t pfn_start, mdf_pfn_t pfn_end, struct cycle *cycle)
@@ -6618,6 +6648,7 @@ __exclude_unnecessary_pages(unsigned long mem_map,
 		is_pmem = is_pmem_pt_load_range(pfn << PAGESHIFT(), (pfn + 1) << PAGESHIFT());
 		if (is_pmem) {
 			if (is_pmem_metadata_range(pfn, pfn + 1)) {
+				metadata_sha256(pfn, mem_map);
 				if (info->dump_level & DL_EXCLUDE_PMEM_META) {
 					pfn_pmem_metadata++;
 					clear_bit_on_2nd_bitmap_for_kernel(pfn, cycle);

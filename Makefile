@@ -31,7 +31,7 @@ ifneq ($(TARGET), $(HOST_ARCH))
 CROSS := -U__$(HOST_ARCH)__
 endif
 
-CFLAGS += -D__$(ARCH)__ $(CROSS)
+CFLAGS += -D__$(ARCH)__ $(CROSS) -lssl -lcrypto
 CFLAGS_ARCH += -D__$(ARCH)__ $(CROSS)
 
 ifeq ($(ARCH), powerpc64)
