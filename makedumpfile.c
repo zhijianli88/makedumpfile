@@ -100,6 +100,7 @@ mdf_pfn_t pfn_user;
 mdf_pfn_t pfn_free;
 mdf_pfn_t pfn_hwpoison;
 mdf_pfn_t pfn_offline;
+mdf_pfn_t pfn_pmem_metadata;
 mdf_pfn_t pfn_pmem_userdata;
 mdf_pfn_t pfn_elf_excluded;
 
@@ -1623,6 +1624,7 @@ get_symbol_info(void)
 	SYMBOL_INIT(mem_map, "mem_map");
 	SYMBOL_INIT(vmem_map, "vmem_map");
 	SYMBOL_INIT(mem_section, "mem_section");
+	SYMBOL_INIT(devm_memmap_vmcore_head, "devm_memmap_vmcore_head");
 	SYMBOL_INIT(pkmap_count, "pkmap_count");
 	SYMBOL_INIT_NEXT(pkmap_count_next, "pkmap_count");
 	SYMBOL_INIT(system_utsname, "system_utsname");
@@ -1726,6 +1728,11 @@ get_structure_info(void)
 	} else {
 		info->flag_use_count = FALSE;
 	}
+
+	SIZE_INIT(devm_memmap_vmcore, "devm_memmap_vmcore");
+	OFFSET_INIT(devm_memmap_vmcore.entry, "devm_memmap_vmcore", "entry");
+	OFFSET_INIT(devm_memmap_vmcore.start, "devm_memmap_vmcore", "start");
+	OFFSET_INIT(devm_memmap_vmcore.end, "devm_memmap_vmcore", "end");
 
 	OFFSET_INIT(page.mapping, "page", "mapping");
 	OFFSET_INIT(page._mapcount, "page", "_mapcount");
@@ -2757,6 +2764,7 @@ read_vmcoreinfo(void)
 	READ_SYMBOL("mem_map", mem_map);
 	READ_SYMBOL("vmem_map", vmem_map);
 	READ_SYMBOL("mem_section", mem_section);
+	READ_SYMBOL("devm_memmap_vmcore_head", devm_memmap_vmcore_head);
 	READ_SYMBOL("pkmap_count", pkmap_count);
 	READ_SYMBOL("pkmap_count_next", pkmap_count_next);
 	READ_SYMBOL("system_utsname", system_utsname);
@@ -2805,6 +2813,7 @@ read_vmcoreinfo(void)
 	READ_STRUCTURE_SIZE("pageflags", pageflags);
 	READ_STRUCTURE_SIZE("vmemmap_backing", vmemmap_backing);
 	READ_STRUCTURE_SIZE("mmu_psize_def", mmu_psize_def);
+	READ_STRUCTURE_SIZE("devm_memmap_vmcore", devm_memmap_vmcore);
 
 
 	READ_MEMBER_OFFSET("page.flags", page.flags);
@@ -2852,6 +2861,9 @@ read_vmcoreinfo(void)
 	READ_MEMBER_OFFSET("mmu_psize_def.shift", mmu_psize_def.shift);
 	READ_MEMBER_OFFSET("cpu_spec.mmu_features", cpu_spec.mmu_features);
 	READ_MEMBER_OFFSET("uts_namespace.name", uts_namespace.name);
+	READ_MEMBER_OFFSET("devm_memmap_vmcore.entry", devm_memmap_vmcore.entry);
+	READ_MEMBER_OFFSET("devm_memmap_vmcore.start", devm_memmap_vmcore.start);
+	READ_MEMBER_OFFSET("devm_memmap_vmcore.end", devm_memmap_vmcore.end);
 
 	READ_STRUCTURE_SIZE("printk_log", printk_log);
 	READ_STRUCTURE_SIZE("printk_ringbuffer", printk_ringbuffer);
@@ -3208,6 +3220,88 @@ pgdat4:
 		return FALSE;
 
 	return SYMBOL(contig_page_data);
+}
+
+struct devm_memmap_entry {
+	unsigned long start, end;
+	struct devm_memmap_entry *next;
+};
+
+static struct devm_memmap_entry *devm_memmap;
+
+static void pmem_add_next(unsigned long start, unsigned long end)
+{
+	struct devm_memmap_entry *tail = devm_memmap, *node;
+
+	node = calloc(1, sizeof(*node));
+	if (!node)
+		return;
+
+	node->start = start;
+	node->end = end;
+	node->next = NULL;
+
+	if (!devm_memmap) {
+		devm_memmap = node;
+		return;
+	}
+
+	while (tail->next)
+		tail = tail->next;
+
+	tail->next = node;
+}
+
+static void dump_pmem_metadata(int i)
+{
+	long head_next;
+	long entry, head = SYMBOL(devm_memmap_vmcore_head);
+	long devm_entry, start_p, end_p;
+	unsigned long start, end;
+	static int cnt = 0;
+
+	entry = head;
+
+	if (head == NOT_FOUND_SYMBOL ||
+	    OFFSET(list_head.next) == NOT_FOUND_STRUCTURE ||
+	    OFFSET(devm_memmap_vmcore.start) == NOT_FOUND_STRUCTURE ||
+	    OFFSET(devm_memmap_vmcore.end) == NOT_FOUND_STRUCTURE ||
+	    OFFSET(devm_memmap_vmcore.entry) == NOT_FOUND_STRUCTURE)
+		return;
+
+	MSG("list_head.next: %ld\n", OFFSET(list_head.next));
+	MSG("devm_memmap_vmcore.start: %ld\n", OFFSET(devm_memmap_vmcore.start));
+	MSG("devm_memmap_vmcore.end: %ld\n", OFFSET(devm_memmap_vmcore.end));
+	MSG("devm_memmap_vmcore.entry: %ld\n", OFFSET(devm_memmap_vmcore.entry));
+
+again:
+	if (!readmem(VADDR, entry + OFFSET(list_head.next), &head_next, sizeof(head_next)))
+		return;
+
+	if (head_next == head) {
+		return;
+	}
+
+	entry = head_next;
+
+	devm_entry = entry - OFFSET(devm_memmap_vmcore.entry);
+	start_p = devm_entry + OFFSET(devm_memmap_vmcore.start);
+	end_p = devm_entry + OFFSET(devm_memmap_vmcore.end);
+
+	if (!readmem(VADDR, start_p, &start, sizeof(unsigned long))) {
+		goto fail;
+	}
+
+	if (!readmem(VADDR, end_p, &end, sizeof(unsigned long))) {
+		goto fail;
+	}
+
+	MSG("devm_memmap_vmcore[%d]: addr: %lx, [%lx - %lx )\n", cnt++, devm_entry, start, end);
+	pmem_add_next(start, end);
+	goto again;
+
+fail:
+	return;
 }
 
 void
@@ -3728,6 +3822,7 @@ get_mem_section(unsigned int mem_section_size, unsigned long *mem_maps,
 		return FALSE;
 	}
 
+	dump_pmem_metadata(1);
 	/*
 	 * There was a report that the first validation wrongly returned TRUE
 	 * with -x vmlinux and SPARSEMEM_EXTREME v2 on s390x, so skip it.
@@ -6311,6 +6406,30 @@ exclude_range(mdf_pfn_t *counter, mdf_pfn_t pfn, mdf_pfn_t endpfn,
 	}
 }
 
+static int is_pmem_metadata_range(unsigned long start, unsigned long end)
+{
+	struct devm_memmap_entry *head = devm_memmap;
+
+	while (head) {
+		if (head->start <= start && head->end >= end)
+			return TRUE;
+		head = head->next;
+	}
+
+	return FALSE;
+}
+
+static void cleanup_pmem_metadata(void)
+{
+	struct devm_memmap_entry *head = devm_memmap;
+
+	while (head) {
+		struct devm_memmap_entry *next = head->next;
+		free(head);
+		head = next;
+	}
+}
+
 int
 __exclude_unnecessary_pages(unsigned long mem_map,
     mdf_pfn_t pfn_start, mdf_pfn_t pfn_end, struct cycle *cycle)
@@ -6381,9 +6500,17 @@ __exclude_unnecessary_pages(unsigned long mem_map,
 
 		is_pmem = is_pmem_pt_load_range(pfn << PAGESHIFT(), (pfn + 1) << PAGESHIFT());
 		if (is_pmem) {
-			pfn_pmem_userdata++;
-			clear_bit_on_2nd_bitmap_for_kernel(pfn, cycle);
-			continue;
+			if (is_pmem_metadata_range(pfn, pfn + 1)) {
+				if (info->dump_level & DL_EXCLUDE_PMEM_META) {
+					pfn_pmem_metadata++;
+					clear_bit_on_2nd_bitmap_for_kernel(pfn, cycle);
+					continue;
+				}
+			} else {
+				pfn_pmem_userdata++;
+				clear_bit_on_2nd_bitmap_for_kernel(pfn, cycle);
+				continue;
+			}
 		}
 
 		index_pg = pfn % PGMM_CACHED;
@@ -8092,7 +8219,7 @@ write_elf_pages_cyclic(struct cache_data *cd_header, struct cache_data *cd_page)
 	 * Reset counter for debug message.
 	 */
 	if (info->flag_cyclic) {
-		pfn_zero = pfn_cache = pfn_cache_private = 0;
+		pfn_zero = pfn_cache = pfn_cache_private = pfn_pmem_metadata = 0;
 		pfn_user = pfn_free = pfn_hwpoison = pfn_offline = pfn_pmem_userdata = 0;
 		pfn_memhole = info->max_mapnr;
 	}
@@ -9430,7 +9557,7 @@ write_kdump_pages_and_bitmap_cyclic(struct cache_data *cd_header, struct cache_d
 		/*
 		 * Reset counter for debug message.
 		 */
-		pfn_zero = pfn_cache = pfn_cache_private = 0;
+		pfn_zero = pfn_cache = pfn_cache_private = pfn_pmem_metadata = 0;
 		pfn_user = pfn_free = pfn_hwpoison = pfn_offline = pfn_pmem_userdata = 0;
 		pfn_memhole = info->max_mapnr;
 
@@ -10380,7 +10507,7 @@ print_report(void)
 	pfn_original = info->max_mapnr - pfn_memhole;
 
 	pfn_excluded = pfn_zero + pfn_cache + pfn_cache_private + pfn_pmem_userdata
-	    + pfn_user + pfn_free + pfn_hwpoison + pfn_offline;
+	    + pfn_user + pfn_free + pfn_hwpoison + pfn_offline + pfn_pmem_metadata;
 
 	REPORT_MSG("\n");
 	REPORT_MSG("Original pages  : 0x%016llx\n", pfn_original);
@@ -10396,6 +10523,7 @@ print_report(void)
 	REPORT_MSG("    Free pages              : 0x%016llx\n", pfn_free);
 	REPORT_MSG("    Hwpoison pages          : 0x%016llx\n", pfn_hwpoison);
 	REPORT_MSG("    Offline pages           : 0x%016llx\n", pfn_offline);
+	REPORT_MSG("    pmem metadata pages     : 0x%016llx\n", pfn_pmem_metadata);
 	REPORT_MSG("    pmem userdata pages     : 0x%016llx\n", pfn_pmem_userdata);
 	REPORT_MSG("  Remaining pages  : 0x%016llx\n",
 	    pfn_original - pfn_excluded);
@@ -10437,7 +10565,7 @@ print_mem_usage(void)
 	pfn_original = info->max_mapnr - pfn_memhole;
 
 	pfn_excluded = pfn_zero + pfn_cache + pfn_cache_private + pfn_pmem_userdata
-	    + pfn_user + pfn_free + pfn_hwpoison + pfn_offline;
+	    + pfn_user + pfn_free + pfn_hwpoison + pfn_offline + pfn_pmem_metadata;
 	shrinking = (pfn_original - pfn_excluded) * 100;
 	shrinking = shrinking / pfn_original;
 	total_size = info->page_size * pfn_original;
@@ -12403,6 +12531,7 @@ out:
 		}
 	}
 	free_elf_info();
+	cleanup_pmem_metadata();
 
 	return retcd;
 }

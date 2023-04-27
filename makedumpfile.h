@@ -206,7 +206,7 @@ test_bit(int nr, unsigned long addr)
  * Dump Level
  */
 #define MIN_DUMP_LEVEL		(0)
-#define MAX_DUMP_LEVEL		(31)
+#define MAX_DUMP_LEVEL		(63)
 #define NUM_ARRAY_DUMP_LEVEL	(MAX_DUMP_LEVEL + 1) /* enough to allocate
 							all the dump_level */
 #define DL_EXCLUDE_ZERO		(0x001) /* Exclude Pages filled with Zeros */
@@ -216,6 +216,7 @@ test_bit(int nr, unsigned long addr)
 				           with Private Pages */
 #define DL_EXCLUDE_USER_DATA	(0x008) /* Exclude UserProcessData Pages */
 #define DL_EXCLUDE_FREE		(0x010)	/* Exclude Free Pages */
+#define DL_EXCLUDE_PMEM_META	(0x020)	/* Exclude pmem metadata Pages */
 
 
 /*
@@ -1711,6 +1712,7 @@ struct symbol_table {
 	unsigned long long	mem_map;
 	unsigned long long	vmem_map;
 	unsigned long long	mem_section;
+	unsigned long long	devm_memmap_vmcore_head;
 	unsigned long long	pkmap_count;
 	unsigned long long	pkmap_count_next;
 	unsigned long long	system_utsname;
@@ -1817,6 +1819,7 @@ struct size_table {
 	long	node_memblk_s;
 	long	nodemask_t;
 	long	printk_log;
+	long	devm_memmap_vmcore;
 
 	/*
 	 * for lockless printk ringbuffer
@@ -1896,6 +1899,11 @@ struct offset_table {
 		long	next;
 		long	prev;
 	} list_head;
+	struct devm_memmap_vmcore {
+		long	entry;
+		long	start;
+		long	end;
+	} devm_memmap_vmcore;
 	struct node_memblk_s {
 		long	start_paddr;
 		long	size;
