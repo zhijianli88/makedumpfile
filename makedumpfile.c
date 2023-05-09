@@ -27,6 +27,8 @@
 #include <limits.h>
 #include <assert.h>
 #include <zlib.h>
+#include <sys/types.h>
+#include <ndctl/libndctl.h>
 
 struct symbol_table	symbol_table;
 struct size_table	size_table;
@@ -100,6 +102,7 @@ mdf_pfn_t pfn_user;
 mdf_pfn_t pfn_free;
 mdf_pfn_t pfn_hwpoison;
 mdf_pfn_t pfn_offline;
+mdf_pfn_t pfn_pmem_metadata;
 mdf_pfn_t pfn_pmem_userdata;
 mdf_pfn_t pfn_elf_excluded;
 
@@ -6311,6 +6314,173 @@ exclude_range(mdf_pfn_t *counter, mdf_pfn_t pfn, mdf_pfn_t endpfn,
 	}
 }
 
+struct pmem_metadata_node {
+	unsigned long long start;
+	unsigned long long end;
+	struct pmem_metadata_node *next;
+} pmem_metadata_head;
+
+struct pmem_metadata_node *pmem_head = NULL;
+
+static void pmem_add_next(unsigned long long start, unsigned long long dataoff)
+{
+	struct pmem_metadata_node *tail = pmem_head, *node;
+
+	node = calloc(1, sizeof(*node));
+	if (!node)
+		return;
+
+	node->start = start >> info->page_shift;
+	node->end = (start + dataoff) >> info->page_shift;
+	node->next = NULL;
+
+	if (!pmem_head) {
+		pmem_head = node;
+		return;
+	}
+	while (tail->next)
+		tail = tail->next;
+	tail->next = node;
+}
+
+static void cleanup_pmem_metadata(void)
+{
+	struct pmem_metadata_node *head = pmem_head;
+	while (head) {
+		struct pmem_metadata_node *next = head->next;
+		free(head);
+		head = next;
+	}
+}
+
+static int is_pmem_metadata_range(unsigned long long start, unsigned long long end)
+{
+	struct pmem_metadata_node *head = pmem_head;
+	while (head) {
+		if (head->start <= start && head->end > end)
+			return TRUE;
+		head = head->next;
+	}
+
+	return FALSE;
+}
+
+static void dump_pmem_range(void)
+{
+	int i = 0;
+	struct pmem_metadata_node *node= pmem_head;
+
+	fprintf(stderr, "dump_pmem_range start......\n\n\n");
+	while (node) {
+		fprintf(stderr, "namespace[%d]: metadata[%llx, %llx]\n", i++, node->start, node->end);
+		node = node->next;
+	}
+	fprintf(stderr, "dump_pmem_range end........\n\n\n");
+}
+
+#define INFOBLOCK_SZ (8192)
+#define SZ_4K (4096)
+#define PFN_SIG_LEN 16
+
+typedef uint64_t u64;
+typedef int64_t s64;
+typedef uint32_t u32;
+typedef int32_t s32;
+typedef uint16_t u16;
+typedef int16_t s16;
+typedef uint8_t u8;
+typedef int8_t s8;
+
+typedef int64_t le64;
+typedef int32_t le32;
+typedef int16_t le16;
+
+struct pfn_sb {
+	u8 signature[PFN_SIG_LEN];
+	u8 uuid[16];
+	u8 parent_uuid[16];
+	le32 flags;
+	le16 version_major;
+	le16 version_minor;
+	le64 dataoff; /* relative to namespace_base + start_pad */
+	le64 npfns;
+	le32 mode;
+	/* minor-version-1 additions for section alignment */
+	le32 start_pad;
+	le32 end_trunc;
+	/* minor-version-2 record the base alignment of the mapping */
+	le32 align;
+	/* minor-version-3 guarantee the padding and flags are zero */
+	/* minor-version-4 record the page size and struct page size */
+	le32 page_size;
+	le16 page_struct_size;
+	u8 padding[3994];
+	le64 checksum;
+};
+
+static int nd_read_infoblock_dataoff(struct ndctl_namespace *ndns)
+{
+	int fd, rc;
+	char path[50];
+	char buf[INFOBLOCK_SZ + 1];
+	struct pfn_sb *pfn_sb = (struct pfn_sb *)(buf + SZ_4K);
+
+	sprintf(path, "/dev/%s", ndctl_namespace_get_block_device(ndns));
+
+	fd = open(path, O_RDONLY|O_EXCL);
+	if (fd < 0)
+		return -1;
+
+	rc = read(fd, buf, INFOBLOCK_SZ);
+	if (rc < INFOBLOCK_SZ) {
+		return -1;
+	}
+
+	return pfn_sb->dataoff;
+}
+
+int inspect_pmem_namespace(void)
+{
+	struct ndctl_ctx *ctx;
+	struct ndctl_bus *bus;
+	int rc = -1;
+
+	fprintf(stderr, "\n\ninspect_pmem_namespace!!\n\n");
+	rc = ndctl_new(&ctx);
+	if (rc)
+		return -1;
+
+	ndctl_bus_foreach(ctx, bus) {
+		struct ndctl_region *region;
+
+		ndctl_region_foreach(bus, region) {
+			struct ndctl_namespace *ndns;
+
+			ndctl_namespace_foreach(region, ndns) {
+				enum ndctl_namespace_mode mode;
+				long long start, end_metadata;
+
+				mode = ndctl_namespace_get_mode(ndns);
+				/* kdump kernel should set force_raw, mode become *safe* */
+				if (mode == NDCTL_NS_MODE_SAFE) {
+					fprintf(stderr, "Only raw can be dumpable\n");
+					continue;
+				}
+
+				start = ndctl_namespace_get_resource(ndns);
+				end_metadata = nd_read_infoblock_dataoff(ndns);
+
+				/* metadata really starts from 2M alignment */
+				if (start != ULLONG_MAX && end_metadata > 2 * 1024 * 1024) // 2M
+					pmem_add_next(start, end_metadata);
+			}
+		}
+	}
+
+	ndctl_unref(ctx);
+	return 0;
+}
+
 int
 __exclude_unnecessary_pages(unsigned long mem_map,
     mdf_pfn_t pfn_start, mdf_pfn_t pfn_end, struct cycle *cycle)
@@ -6381,9 +6551,17 @@ __exclude_unnecessary_pages(unsigned long mem_map,
 
 		is_pmem = is_pmem_pt_load_range(pfn << PAGESHIFT(), (pfn + 1) << PAGESHIFT());
 		if (is_pmem) {
-			pfn_pmem_userdata++;
-			clear_bit_on_2nd_bitmap_for_kernel(pfn, cycle);
-			continue;
+			if (is_pmem_metadata_range(pfn, pfn + 1)) {
+				if (info->dump_level & DL_EXCLUDE_PMEM_META) {
+					pfn_pmem_metadata++;
+					clear_bit_on_2nd_bitmap_for_kernel(pfn, cycle);
+					continue;
+				}
+			} else {
+				pfn_pmem_userdata++;
+				clear_bit_on_2nd_bitmap_for_kernel(pfn, cycle);
+				continue;
+			}
 		}
 
 		index_pg = pfn % PGMM_CACHED;
@@ -8092,7 +8270,7 @@ write_elf_pages_cyclic(struct cache_data *cd_header, struct cache_data *cd_page)
 	 * Reset counter for debug message.
 	 */
 	if (info->flag_cyclic) {
-		pfn_zero = pfn_cache = pfn_cache_private = 0;
+		pfn_zero = pfn_cache = pfn_cache_private = pfn_pmem_metadata = 0;
 		pfn_user = pfn_free = pfn_hwpoison = pfn_offline = pfn_pmem_userdata = 0;
 		pfn_memhole = info->max_mapnr;
 	}
@@ -9430,7 +9608,7 @@ write_kdump_pages_and_bitmap_cyclic(struct cache_data *cd_header, struct cache_d
 		/*
 		 * Reset counter for debug message.
 		 */
-		pfn_zero = pfn_cache = pfn_cache_private = 0;
+		pfn_zero = pfn_cache = pfn_cache_private = pfn_pmem_metadata = 0;
 		pfn_user = pfn_free = pfn_hwpoison = pfn_offline = pfn_pmem_userdata = 0;
 		pfn_memhole = info->max_mapnr;
 
@@ -10380,7 +10558,7 @@ print_report(void)
 	pfn_original = info->max_mapnr - pfn_memhole;
 
 	pfn_excluded = pfn_zero + pfn_cache + pfn_cache_private + pfn_pmem_userdata
-	    + pfn_user + pfn_free + pfn_hwpoison + pfn_offline;
+	    + pfn_user + pfn_free + pfn_hwpoison + pfn_offline + pfn_pmem_metadata;
 
 	REPORT_MSG("\n");
 	REPORT_MSG("Original pages  : 0x%016llx\n", pfn_original);
@@ -10396,6 +10574,7 @@ print_report(void)
 	REPORT_MSG("    Free pages              : 0x%016llx\n", pfn_free);
 	REPORT_MSG("    Hwpoison pages          : 0x%016llx\n", pfn_hwpoison);
 	REPORT_MSG("    Offline pages           : 0x%016llx\n", pfn_offline);
+	REPORT_MSG("    pmem metadata pages     : 0x%016llx\n", pfn_pmem_metadata);
 	REPORT_MSG("    pmem userdata pages     : 0x%016llx\n", pfn_pmem_userdata);
 	REPORT_MSG("  Remaining pages  : 0x%016llx\n",
 	    pfn_original - pfn_excluded);
@@ -10437,7 +10616,7 @@ print_mem_usage(void)
 	pfn_original = info->max_mapnr - pfn_memhole;
 
 	pfn_excluded = pfn_zero + pfn_cache + pfn_cache_private + pfn_pmem_userdata
-	    + pfn_user + pfn_free + pfn_hwpoison + pfn_offline;
+	    + pfn_user + pfn_free + pfn_hwpoison + pfn_offline + pfn_pmem_metadata;
 	shrinking = (pfn_original - pfn_excluded) * 100;
 	shrinking = shrinking / pfn_original;
 	total_size = info->page_size * pfn_original;
@@ -10730,6 +10909,8 @@ create_dumpfile(void)
 		}
 	}
 
+	inspect_pmem_namespace();
+	dump_pmem_range();
 	print_vtop();
 
 	num_retry = 0;
@@ -12403,6 +12584,7 @@ out:
 		}
 	}
 	free_elf_info();
+	cleanup_pmem_metadata();
 
 	return retcd;
 }
